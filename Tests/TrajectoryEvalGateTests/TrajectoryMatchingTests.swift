@@ -67,7 +67,7 @@ final class TrajectoryMatchingTests: XCTestCase {
         // Greedy assignment in step order gives the permissive step page 1,
         // leaving the picky step with only page 2, and reports a failure. The
         // augmenting-path search moves the permissive step to page 2 and
-        // matches. The two assertions below pin the exact shape of that trap:
+        // matches. The four assertions below pin the exact shape of that trap:
         // step 1 really cannot use call 1, so the only valid assignment is the
         // one greedy would never find.
         let permissive = ExpectedStep(toolName: "search")
@@ -211,13 +211,28 @@ final class TrajectoryMatchingTests: XCTestCase {
         XCTAssertFalse(TrajectoryMatcher.match(Trajectory(calls: calls), against: expectation).didMatch)
     }
 
-    func testJustInsideTheSearchBudgetIsStillAnalysed() {
-        let steps = [ExpectedStep(toolName: "a")]
-        let callCount = 1_000
-        let calls = (0..<callCount).map { _ in self.call("a") }
+    func testTheSearchBudgetBoundaryIsExactlyWhereItClaimsToBe() {
+        // The off-by-one on `cellCount > maximumSearchCells` is only verifiable
+        // at the boundary itself. 249 steps x 999 calls is
+        // (249 + 1) * (999 + 1) = 250,000 cells — exactly the ceiling — and
+        // must be analysed. One more call is 250 * 1001 = 250,250 and must not.
+        XCTAssertEqual(TrajectoryMatcher.maximumSearchCells, 250_000)
+
+        // Steps are optional and name a tool no call uses, so the trajectory
+        // genuinely matches by skipping everything — which makes "analysed"
+        // and "not analysed" distinguishable by the verdict rather than only by
+        // the diff flag.
+        let steps = (0..<249).map { _ in ExpectedStep(toolName: "never-called", isOptional: true) }
+        let atCeiling = (0..<999).map { _ in self.call("a") }
         let expectation = TrajectoryExpectation(steps: steps, ordering: .subsequence)
-        let result = TrajectoryMatcher.match(Trajectory(calls: calls), against: expectation)
-        XCTAssertTrue(result.didMatch)
+
+        let inside = TrajectoryMatcher.match(Trajectory(calls: atCeiling), against: expectation)
+        XCTAssertTrue(inside.didMatch, "250,000 cells is exactly the ceiling and must be analysed")
+
+        let overCeiling = atCeiling + [call("a")]
+        let outside = TrajectoryMatcher.match(Trajectory(calls: overCeiling), against: expectation)
+        XCTAssertFalse(outside.didMatch)
+        XCTAssertEqual(outside.diff?.analysisBudgetExceeded, true)
     }
 
     func testUnorderedStepCeilingIsEnforced() {

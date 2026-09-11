@@ -19,15 +19,124 @@ final class PrimitiveTests: XCTestCase {
         XCTAssertEqual(Saturating.clampedToInt(-42.9), -42)
     }
 
-    func testIntConversionCeilingIsDerivedNotHardcoded() {
-        // Guards the watchOS case: a hardcoded 64-bit literal would be wrong on
-        // a 32-bit `Int`, and this assertion is the only thing that would
-        // notice.
-        XCTAssertEqual(Saturating.intConversionCeiling, Double(Int.max))
-        XCTAssertEqual(Saturating.intConversionFloor, Double(Int.min))
-        // `Double(Int.max)` rounds up past `Int.max`, so converting it back
-        // would trap. The strict `<` in `clampedToInt` is what stops that.
+    func testIntConversionBoundsAreSafeOnThisPlatformsIntWidth() {
+        // The watchOS case, where `Int` is 32-bit and a hardcoded 64-bit
+        // literal ceiling would be a silent trap. Asserting the constant equals
+        // `Double(Int.max)` would only restate its definition, so these assert
+        // the behaviour instead: the exact platform boundaries convert without
+        // trapping, and one ulp beyond them saturates.
+        //
+        // `Double(Int.max)` rounds *up* past `Int.max` on 64-bit (2^63 is not
+        // an `Int` but is an exact `Double`), so this call is the one that
+        // would trap without the strict `<`.
         XCTAssertEqual(Saturating.clampedToInt(Double(Int.max)), Int.max)
+        XCTAssertEqual(Saturating.clampedToInt(Double(Int.min)), Int.min)
+        XCTAssertEqual(Saturating.clampedToInt(Double(Int.max).nextUp), Int.max)
+        XCTAssertEqual(Saturating.clampedToInt(Double(Int.min).nextDown), Int.min)
+        // And a value comfortably inside the range still round-trips. Chosen to
+        // be exactly representable as a `Double` on both 32- and 64-bit `Int`:
+        // `Double(Int.max / 4)` is not, and would fail by one.
+        XCTAssertEqual(Saturating.clampedToInt(1_000_000), 1_000_000)
+        XCTAssertEqual(Saturating.clampedToInt(-1_000_000), -1_000_000)
+    }
+
+    // MARK: - Untrusted nesting depth
+
+    func testDeeplyNestedArgumentValueIsTruncatedRatherThanOverflowingTheStack() {
+        // Tool arguments are JSON from a backend, so their *depth* is untrusted
+        // input to three recursive walkers: `==`, `hash(into:)` and
+        // `description`. Without the boundary normalisation in `ToolCall.init`
+        // those walkers recurse once per level of whatever a backend sends;
+        // 2,000 is chosen to be comfortably survivable so the *assertion* is
+        // about truncation rather than about surviving, but the real hazard is
+        // a 100k-deep payload, where the failure mode is a stack overflow — a
+        // crash rather than a catchable error, taking the whole CI job down
+        // instead of failing one case.
+        var deep = ArgumentValue.int(1)
+        for _ in 0..<2_000 {
+            deep = .list([deep])
+        }
+
+        let call = ToolCall(name: "t", arguments: ["payload": deep])
+        let stored = call.arguments["payload"]
+        XCTAssertNotNil(stored)
+
+        // Equality, hashing and description all complete instead of trapping.
+        XCTAssertEqual(call, ToolCall(name: "t", arguments: ["payload": deep]))
+        XCTAssertEqual(Set([call]).count, 1)
+        XCTAssertTrue(stored?.description.contains(ArgumentValue.truncationMarker) ?? false)
+
+        // And the stored value really is bounded: peeling `maximumDepth` layers
+        // reaches the marker rather than more list.
+        var cursor = stored
+        var peeled = 0
+        while case .list(let inner) = cursor, let first = inner.first {
+            cursor = first
+            peeled += 1
+            if peeled > ArgumentValue.maximumDepth { break }
+        }
+        XCTAssertEqual(peeled, ArgumentValue.maximumDepth)
+        XCTAssertEqual(cursor, .string(ArgumentValue.truncationMarker))
+    }
+
+    func testShallowValuesAreUntouchedByTheDepthLimit() {
+        // The normalisation must not alter anything a real tool would send.
+        let value = ArgumentValue.object([
+            "sku": .string("THD-1"),
+            "tags": .list([.string("a"), .int(2), .bool(true), .null])
+        ])
+        XCTAssertEqual(ToolCall(name: "t", arguments: ["v": value]).arguments["v"], value)
+        XCTAssertEqual(value.depthLimited(), value)
+    }
+
+    func testDeeplyNestedMatcherLiteralIsNormalisedAtTheContractBoundary() {
+        var deep = ArgumentValue.int(1)
+        for _ in 0..<2_000 {
+            deep = .list([deep])
+        }
+        // `ExpectedStep.init` normalises, so the matcher a step holds can never
+        // recurse without a ceiling either.
+        let step = ExpectedStep(toolName: "t", arguments: ["v": .equals(deep)])
+        guard case .equals(let normalised)? = step.arguments["v"] else {
+            return XCTFail("expected an `.equals` matcher")
+        }
+        XCTAssertNotEqual(normalised, deep)
+        XCTAssertTrue(normalised.description.contains(ArgumentValue.truncationMarker))
+        // It still evaluates, and still fails to match an ordinary value.
+        XCTAssertNotNil(step.arguments["v"]?.evaluate(key: "v", value: .int(1)))
+    }
+
+    func testOverDeepCompositeMatcherNormalisesToOneThatNeverMatches() {
+        let overDepth = ArgumentMatcher.maximumNestingDepth + 20
+        var matcher = ArgumentMatcher.any
+        for _ in 0..<overDepth {
+            matcher = .allOf([matcher])
+        }
+        let normalised = matcher.normalized()
+
+        // Asserting only that `evaluate` reports a mismatch would prove
+        // nothing: the runtime depth guard already does that for the
+        // *un-normalised* matcher, so a `normalized()` gutted to `return self`
+        // would pass. The assertion is therefore structural — the tree really
+        // was rewritten.
+        XCTAssertNotEqual(normalised, matcher)
+
+        // Peeling `maximumNestingDepth` layers reaches the substituted
+        // `.anyOf([])` sentinel, not more `.allOf`.
+        var cursor = normalised
+        var peeled = 0
+        while case .allOf(let inner) = cursor, let first = inner.first {
+            cursor = first
+            peeled += 1
+            if peeled > ArgumentMatcher.maximumNestingDepth { break }
+        }
+        XCTAssertEqual(peeled, ArgumentMatcher.maximumNestingDepth)
+        XCTAssertEqual(cursor, .anyOf([]))
+
+        // `.anyOf([])` never matches and says why, rather than collapsing to a
+        // silently-passing `.any`.
+        XCTAssertNotNil(normalised.evaluate(key: "k", value: .int(1)))
+        XCTAssertNotNil(ArgumentMatcher.anyOf([]).evaluate(key: "k", value: .int(1)))
     }
 
     func testIntegerOperationsSaturateInsteadOfTrapping() {

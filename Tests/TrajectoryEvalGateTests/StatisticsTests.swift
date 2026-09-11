@@ -28,16 +28,36 @@ final class StatisticsTests: XCTestCase {
         XCTAssertLessThan(Statistics.wilsonLowerBound(successes: 3, trials: 3), 0.5)
     }
 
-    func testAWaldIntervalWouldHaveZeroWidthWhereWilsonDoesNot() {
-        // Negative control against the textbook alternative. The Wald interval
-        // is `p ± z·sqrt(p(1-p)/n)`, which collapses to a point at `p == 1`
-        // and would report a lower bound of exactly 1.0 for 5/5. Wilson does
-        // not, and that difference is the whole reason for the extra algebra.
-        let p = 1.0, n = 5.0
-        let waldHalfWidth = Statistics.Z.ninetyFive * (p * (1 - p) / n).squareRoot()
-        XCTAssertEqual(waldHalfWidth, 0, accuracy: 1e-12)
-        XCTAssertEqual(p - waldHalfWidth, 1.0, accuracy: 1e-12)
-        XCTAssertLessThan(Statistics.wilsonLowerBound(successes: 5, trials: 5), 0.6)
+    /// The textbook alternative this package deliberately does not use:
+    /// `p ± z·sqrt(p(1-p)/n)`. Implemented here, in the test target, purely so
+    /// the comparison below is a real side-by-side rather than a claim in a
+    /// comment.
+    private func waldLowerBound(successes: Int, trials: Int, z: Double = Statistics.Z.ninetyFive) -> Double {
+        guard trials > 0 else { return 0 }
+        let p = Double(successes) / Double(trials)
+        return p - z * (p * (1 - p) / Double(trials)).squareRoot()
+    }
+
+    func testWilsonDoesNotCollapseWhereWaldWould() {
+        // The negative control for the package's central claim, run against an
+        // actual competing implementation rather than against prose.
+        //
+        // At `p == 1` the Wald radical is zero for every `n`, so Wald certifies
+        // a perfect pass rate from five samples. Wilson does not, and that gap
+        // is the entire reason for the extra algebra.
+        for n in [3, 5, 20, 10_000] {
+            XCTAssertEqual(waldLowerBound(successes: n, trials: n), 1.0, accuracy: 1e-12,
+                           "Wald must collapse to a point at p == 1 for n = \(n)")
+            XCTAssertLessThan(Statistics.wilsonLowerBound(successes: n, trials: n), 1.0,
+                              "Wilson must stay strictly below 1.0 for n = \(n)")
+        }
+        // And the gap at small n is enormous, not a rounding difference: Wald
+        // says 1.0, Wilson says 0.5655.
+        XCTAssertEqual(Statistics.wilsonLowerBound(successes: 5, trials: 5), 0.565509, accuracy: 1e-5)
+        XCTAssertGreaterThan(waldLowerBound(successes: 5, trials: 5) - Statistics.wilsonLowerBound(successes: 5, trials: 5), 0.43)
+        // Away from the boundary the two agree to within a few points, which is
+        // why the boundary case is the one that matters.
+        XCTAssertEqual(waldLowerBound(successes: 15, trials: 20), Statistics.wilsonLowerBound(successes: 15, trials: 20), accuracy: 0.05)
     }
 
     func testWilsonBoundIsMonotonicInSampleSizeForPerfectRuns() {
@@ -55,21 +75,27 @@ final class StatisticsTests: XCTestCase {
         XCTAssertEqual(Statistics.wilsonInterval(successes: 5, trials: -3), 0...1)
         // Successes above trials is a caller bug; clamping yields the
         // conservative all-pass answer rather than an interval outside 0...1.
-        XCTAssertEqual(
-            Statistics.wilsonLowerBound(successes: 99, trials: 10),
-            Statistics.wilsonLowerBound(successes: 10, trials: 10),
-            accuracy: 1e-12
-        )
-        XCTAssertEqual(Statistics.wilsonLowerBound(successes: -5, trials: 10), 0, accuracy: 1e-12)
-        // A non-finite z falls back to 95% rather than producing NaN bounds.
-        XCTAssertEqual(
-            Statistics.wilsonLowerBound(successes: 9, trials: 10, z: .nan),
-            Statistics.wilsonLowerBound(successes: 9, trials: 10),
-            accuracy: 1e-12
-        )
+        // Asserted against the precomputed 10/10 value rather than against
+        // another call to the function under test.
+        XCTAssertEqual(Statistics.wilsonLowerBound(successes: 99, trials: 10), 0.722460, accuracy: 1e-5)
+        // Negative successes clamp to zero. The lower bound alone would be 0
+        // either way (the final `0...1` clamp would catch it), so the *upper*
+        // bound is what distinguishes clamping from not clamping: unclamped,
+        // `p̂ = -0.5` produces a negative centre and an upper bound of 0.
+        let negative = Statistics.wilsonInterval(successes: -5, trials: 10)
+        let zero = Statistics.wilsonInterval(successes: 0, trials: 10)
+        XCTAssertEqual(negative.lowerBound, zero.lowerBound, accuracy: 1e-12)
+        XCTAssertEqual(negative.upperBound, zero.upperBound, accuracy: 1e-12)
+        XCTAssertGreaterThan(negative.upperBound, 0.2)
+        // A non-finite or negative z falls back to 95% rather than producing
+        // NaN bounds: 9/10 at z = 1.96 is 0.595844.
+        XCTAssertEqual(Statistics.wilsonLowerBound(successes: 9, trials: 10, z: .nan), 0.595844, accuracy: 1e-5)
+        XCTAssertEqual(Statistics.wilsonLowerBound(successes: 9, trials: 10, z: -1), 0.595844, accuracy: 1e-5)
+        // 0 of 20, precomputed. Asserting only "inside 0...1" would be
+        // vacuously true — `wilsonInterval` clamps both ends by construction.
         let bounds = Statistics.wilsonInterval(successes: 0, trials: 20)
-        XCTAssertGreaterThanOrEqual(bounds.lowerBound, 0)
-        XCTAssertLessThanOrEqual(bounds.upperBound, 1)
+        XCTAssertEqual(bounds.lowerBound, 0, accuracy: 1e-12)
+        XCTAssertEqual(bounds.upperBound, 0.161130, accuracy: 1e-5)
     }
 
     // MARK: - Policy feasibility
@@ -204,16 +230,28 @@ final class StatisticsTests: XCTestCase {
         }
         XCTAssertEqual(passes, 3)
         XCTAssertEqual(runs, 4)
-        XCTAssertEqual(lowerBound, Statistics.wilsonLowerBound(successes: 3, trials: 4), accuracy: 1e-12)
+        // Precomputed, not fetched from the function that produced it.
+        XCTAssertEqual(lowerBound, 0.300636, accuracy: 1e-5)
         XCTAssertTrue(verdict.describesInstability)
     }
 
     func testAlternationRateDistinguishesARegimeChangeFromNoise() {
         let regimeChange = [true, true, true, true, true, false, false, false, false, false]
         let noisy = [true, false, true, false, true, false, true, false, true, false]
-        XCTAssertEqual(FlakeClassifier.classify(outcomes: regimeChange, minimumRuns: 10),
-                       FlakeClassifier.classify(outcomes: noisy, minimumRuns: 10))
-        // Identical pass rates, very different stories.
+        // Both classify identically — 5 of 10, bound 0.236590 — which is the
+        // setup, not the assertion: a `classify` that returned a constant would
+        // also satisfy an equality check between the two, so both verdicts are
+        // pinned to precomputed values instead.
+        for outcomes in [regimeChange, noisy] {
+            guard case .flaky(let passes, let runs, let bound) = FlakeClassifier.classify(outcomes: outcomes, minimumRuns: 10) else {
+                return XCTFail("5 of 10 must classify as flaky")
+            }
+            XCTAssertEqual(passes, 5)
+            XCTAssertEqual(runs, 10)
+            XCTAssertEqual(bound, 0.236590, accuracy: 1e-5)
+        }
+        // Identical pass rates, very different stories — and the alternation
+        // rate is where the difference shows up.
         XCTAssertEqual(FlakeClassifier.alternationRate(outcomes: regimeChange), 1.0 / 9.0, accuracy: 1e-12)
         XCTAssertEqual(FlakeClassifier.alternationRate(outcomes: noisy), 1.0, accuracy: 1e-12)
         XCTAssertEqual(FlakeClassifier.alternationRate(outcomes: [true]), 0)

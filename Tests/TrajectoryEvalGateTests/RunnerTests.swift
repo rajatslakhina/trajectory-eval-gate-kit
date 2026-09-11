@@ -98,14 +98,27 @@ final class RunnerTests: XCTestCase {
 
     // MARK: - Determinism
 
-    func testTheSameSeedProducesTheSameReport() async {
-        let policy = GatePolicy.standard
+    func testTheSameSeedProducesTheSameReportAcrossProcesses() async {
+        // Asserting only `first == second` would hold for a backend gutted to
+        // always pass, always fail, or always throw — the very "call it twice
+        // in one process" antipattern this package criticises elsewhere. So the
+        // outcome sequence is pinned to values recorded out-of-band from an
+        // earlier process. If the PRNG, the seed derivation, or the FNV-1a
+        // hashing of the case id changes, these fail; a constant backend fails
+        // them too.
+        let policy = GatePolicy(minimumRuns: 40, maximumRuns: 40, requiredPassRateLowerBound: 0.5, allowsEarlyStop: false)
         let first = await EvalGateRunner(backend: backend(passProbability: 0.8, seed: 99), budget: EvalBudget(maximumRuns: 500))
             .evaluate(cases: [singleCase()], policy: policy)
         let second = await EvalGateRunner(backend: backend(passProbability: 0.8, seed: 99), budget: EvalBudget(maximumRuns: 500))
             .evaluate(cases: [singleCase()], policy: policy)
         XCTAssertEqual(first, second)
+        XCTAssertEqual(first.results[0].evidence.runs, 40)
+        XCTAssertEqual(first.results[0].evidence.passes, Self.recordedPassesForSeed99)
     }
+
+    /// Recorded from a previous process, not computed here. See
+    /// ``testTheSameSeedProducesTheSameReportAcrossProcesses``.
+    static let recordedPassesForSeed99 = 32
 
     func testDifferentSeedsExploreDifferentOutcomeSequences() async {
         // Guards against a seed that is accepted and then ignored — which would
@@ -208,9 +221,7 @@ final class RunnerTests: XCTestCase {
         XCTAssertTrue(report.headline.contains("not a pass"))
     }
 
-    func testDriftAgainstABaselineIsSurfacedEvenWhenTheCaseStillPasses() async {
-        // Baseline of 60/60; current behaviour is perfect too, so there is no
-        // drift — and a case with a genuinely worse baseline shows the opposite.
+    func testDriftWithinNoiseIsNotReportedAsDrift() async {
         let steady = EvalCase(
             id: "case-1",
             prompt: "price?",
@@ -223,6 +234,51 @@ final class RunnerTests: XCTestCase {
         // 35/35 against a 34/35 baseline is within noise.
         XCTAssertEqual(report.results[0].driftIsSignificant, false)
         XCTAssertEqual(report.driftedCases.count, 0)
+    }
+
+    func testASignificantDropAgainstTheBaselineIsSurfaced() async {
+        // The true direction of the drift path, which the "within noise" test
+        // above cannot reach. Without this, `driftIsSignificant == true` and a
+        // non-empty `driftedCases` are never observed anywhere in the suite,
+        // and the wiring could be broken in the affirmative direction without a
+        // single test noticing.
+        let regressed = EvalCase(
+            id: "case-1",
+            prompt: "price?",
+            expectation: Fixtures.barcodePriceCheck,
+            baseline: BaselineRecord(passes: 60, runs: 60)
+        )
+        let report = await EvalGateRunner(backend: backend(passProbability: 0.5), budget: EvalBudget(maximumRuns: 500))
+            .evaluate(cases: [regressed], policy: .standard)
+
+        XCTAssertEqual(report.results[0].driftIsSignificant, true)
+        XCTAssertEqual(report.driftedCases.count, 1)
+        XCTAssertTrue(report.headline.contains("drifted"))
+        // Drift is reported alongside the verdict, not instead of it.
+        XCTAssertFalse(report.isGreen)
+    }
+
+    func testASampleDominatedByTransportErrorsIsInconclusiveNotFailing() async {
+        // The second `inconclusive` branch: enough runs completed to clear the
+        // minimum, but more attempts errored than completed. Reporting that as
+        // `fail` would send someone to debug a prompt when the real problem is
+        // a proxy. `testABackendThatAlwaysThrows…` cannot reach this branch,
+        // because there the completed-run count is zero and the *first* branch
+        // catches it.
+        let policy = GatePolicy(minimumRuns: 10, maximumRuns: 100, requiredPassRateLowerBound: 0.90)
+        let flakyTransport = backend(passProbability: 1.0, errorProbability: 0.7)
+        let report = await EvalGateRunner(backend: flakyTransport, budget: EvalBudget(maximumRuns: 500))
+            .evaluate(cases: [singleCase()], policy: policy)
+
+        let result = report.results[0]
+        XCTAssertGreaterThanOrEqual(result.evidence.runs, policy.minimumRuns)
+        XCTAssertGreaterThan(result.errorCount, result.evidence.runs)
+        guard case .inconclusive(let reason) = result.outcome else {
+            return XCTFail("an error-dominated sample must be inconclusive, not a failure — got \(result.outcome)")
+        }
+        XCTAssertTrue(reason.contains("infrastructure"))
+        XCTAssertEqual(report.failingCases.count, 0)
+        XCTAssertFalse(report.isGreen)
     }
 
     func testBaselineRecordClampsNonsense() {
@@ -246,6 +302,52 @@ final class RunnerTests: XCTestCase {
         XCTAssertFalse(shelf?.outcome.isPass ?? true)
     }
 
+    func testTheShippedDemoSweepMatchesTheFiguresTheREADMEsQuote() async {
+        // Both READMEs print this sweep's numbers as measured fact. This test
+        // is what makes that claim machine-checked rather than transcribed: if
+        // a fixture, the PRNG, the policy or the early-stopping rule changes,
+        // the READMEs go stale and this fails in the same commit.
+        let policy = GatePolicy.standard
+        let runner = EvalGateRunner(
+            backend: Fixtures.demoBackend(),
+            budget: .sufficient(for: policy, caseCount: 3, tokensPerRun: 800)
+        )
+        let report = await runner.evaluate(cases: Fixtures.demoCases, policy: policy)
+
+        XCTAssertFalse(report.isGreen)
+        XCTAssertEqual(report.runsSpent, 109)
+        XCTAssertEqual(report.failingCases.count, 1)
+        XCTAssertEqual(report.flakyCases.count, 2)
+
+        func result(_ id: String) -> CaseResult? { report.results.first { $0.id == id } }
+
+        let barcode = result(Fixtures.barcodeCaseID)
+        XCTAssertEqual(barcode?.evidence.runs, 53)
+        XCTAssertEqual(barcode?.evidence.passes, 52)
+        XCTAssertEqual(barcode?.outcome, .pass)
+        XCTAssertEqual(barcode?.evidence.passRateLowerBound ?? 0, 0.901, accuracy: 5e-4)
+        // Passing *and* flaky — the report says both rather than collapsing them.
+        XCTAssertEqual(barcode?.stability.describesInstability, true)
+
+        let shelf = result(Fixtures.shelfLabelCaseID)
+        XCTAssertEqual(shelf?.evidence.runs, 20)
+        XCTAssertEqual(shelf?.evidence.passes, 18)
+        // The headline row: an observed rate of exactly 0.90 that the gate
+        // fails, because the lower bound on it is 0.699.
+        XCTAssertEqual(shelf?.evidence.observedPassRate ?? 0, 0.90, accuracy: 1e-12)
+        XCTAssertEqual(shelf?.evidence.passRateLowerBound ?? 0, 0.699, accuracy: 5e-4)
+        XCTAssertEqual(shelf?.outcome.isPass, false)
+
+        let cart = result(Fixtures.addToCartCaseID)
+        XCTAssertEqual(cart?.evidence.runs, 35)
+        XCTAssertEqual(cart?.evidence.passes, 35)
+        XCTAssertEqual(cart?.errorCount, 1)
+        XCTAssertEqual(cart?.outcome, .pass)
+
+        // All three stopped before the 60-run ceiling.
+        XCTAssertTrue(report.results.allSatisfy { $0.evidence.stoppedEarly })
+    }
+
     // MARK: - Concurrency
 
     func testConcurrentSweepsCannotOverspendTheBudget() async {
@@ -261,7 +363,12 @@ final class RunnerTests: XCTestCase {
 
         let spent = await runner.spentRuns
         XCTAssertEqual(spent, 25)
-        XCTAssertLessThanOrEqual(reports.map(\.runsSpent).max() ?? 0, 25)
+        // The strong assertion: each report accounts for its own spend, and the
+        // two together account for exactly the ledger. `max() <= 25` would be
+        // satisfied by both reports echoing the shared total, which is the bug
+        // this is here to catch.
+        XCTAssertEqual(reports.map(\.runsSpent).reduce(0, +), 25)
+        XCTAssertEqual(reports.map(\.tokensSpent).reduce(0, +), 25 * 100)
         // Neither sweep reached 35 runs, so neither can be green.
         XCTAssertTrue(reports.allSatisfy { !$0.isGreen })
     }
