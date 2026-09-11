@@ -36,9 +36,12 @@ model bolted on. The specific failures that produces:
 | "A model judges the answer" | An uncalibrated judge that always says "pass" scores **90% raw agreement** on a 90%-passing set. |
 | "Quorum of N, majority wins" | Cannot distinguish `PPPPPFFFFF` (something changed mid-sweep) from `PFPFPFPFPF` (genuine variance). |
 
-Each row is a test in this package, and several are written as *negative
-controls*: they construct the broken implementation and assert the check
-rejects it.
+Five of those six rows are a test in this package, and several are written as
+*negative controls*: they construct the broken implementation and assert the
+check rejects it. The exception is "retry until it passes" — there is nothing to
+test, because the package offers no retry knob at all. That is the design
+position: retrying destroys the sample the confidence bound is computed from,
+so it is absent rather than discouraged.
 
 ---
 
@@ -94,8 +97,10 @@ pass rate, never the point estimate.
 Wilson rather than the textbook normal ("Wald") interval, because Wald is
 degenerate exactly where eval gates live: at `s == n` its width is zero, so 3/3
 would report a lower bound of 1.0 and every gate would pass on three lucky runs.
-`testAWaldIntervalWouldHaveZeroWidthWhereWilsonDoesNot` asserts that difference
-directly.
+`testWilsonDoesNotCollapseWhereWaldWould` implements Wald in the test target and
+runs the two side by side: for n = 3, 5, 20 and 10,000 it asserts Wald collapses
+to exactly 1.0 while Wilson stays strictly below, and that the gap at n = 5 is
+over 0.43 — not a rounding difference.
 
 For a perfect run the bound simplifies to `n / (n + z²)`, which makes the
 sample-size cost checkable by hand and impossible to argue with:
@@ -147,8 +152,16 @@ variance. Drift against a recorded baseline is a two-proportion z test, checked
 
 ### Judge calibration
 
-Before a model-as-judge may fail a build, it has to agree with a human on
-already-labelled cases — measured with **Cohen's kappa**, not raw agreement.
+The rule: before a model-as-judge may fail a build, it has to agree with a human
+on already-labelled cases — measured with **Cohen's kappa**, not raw agreement.
+
+**Scope, stated precisely.** `JudgeCalibration` implements and tests that rule;
+it does not wire it into the verdict. `EvalGateRunner` grades a run purely on
+whether its trajectory satisfied the contract, and `BackendRunResult.judgeScore`
+is carried but read by nothing in this package. Whether answer *quality* gates a
+release is a product decision, so it belongs in the adapter — the package's job
+is to make sure that when someone reaches for a judge, the calibration check is
+already sitting there.
 
 `testRubberStampJudgeIsRejectedDespiteHighRawAgreement` feeds in a deliberately
 broken judge that answers "pass" to everything, against a 90%-passing set. It
@@ -165,16 +178,29 @@ public protocol EvaluationBackend: Sendable {
 }
 ```
 
-One protocol, one method. On Apple platforms an adapter drives Apple's
-Evaluations framework against Foundation Models (on-device or Private Cloud
-Compute) and translates the result into a `Trajectory`; a remote model conforms
-by parsing tool-call blocks out of an HTTP response; `DeterministicBackend`
-conforms with a seeded PRNG. The gate cannot tell them apart — which is the
-point: the same policy and the same report apply whether the model is on the
+One protocol, one method.
+
+**Exactly one conformer ships here: `DeterministicBackend`, a seeded fake.** The
+adapters are the intended shape, not code in this repo. On Apple platforms an
+adapter *would* conform by driving Apple's Evaluations framework against
+Foundation Models (on-device or Private Cloud Compute) and translating the
+result into a `Trajectory`; a remote model *would* conform by parsing tool-call
+blocks out of an HTTP response. The gate cannot tell backends apart — which is
+the point: the same policy and the same report apply whether the model is on the
 device or across the network.
 
 Keeping the framework outside the package is what lets the entire decision
 layer be unit-tested on Linux, with no device and no network.
+
+**One thing to know before writing that adapter.** This package's
+`TrajectoryExpectation` and `ArgumentMatcher` collide by name with types Apple's
+`Evaluations` framework exports. A file importing both modules must
+module-qualify every use (`TrajectoryEvalGate.ArgumentMatcher` vs
+`Evaluations.ArgumentMatcher`) or `typealias` one side at the top of the adapter.
+The names are kept because they are the right domain names on this side of the
+seam, and because an adapter is the only file that ever sees both — but it is
+the first thing you would hit on integration, so it is stated here rather than
+discovered.
 
 ---
 
@@ -231,10 +257,11 @@ against a shared 25-run budget and asserts exactly 25 runs were spent.
 ## Using it
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/trajectory-eval-gate-kit.git", from: "1.0.0")
+.package(url: "https://github.com/rajatslakhina/trajectory-eval-gate-kit.git", from: "1.1.0")
 ```
 
 ```swift
+import Foundation
 import TrajectoryEvalGate
 
 let contract = TrajectoryExpectation(
@@ -250,7 +277,14 @@ let contract = TrajectoryExpectation(
 let cases = [EvalCase(id: "price-check", prompt: "What does this cost?", expectation: contract)]
 let policy = GatePolicy.standard          // 20–60 runs, 0.90 lower bound
 
-precondition(policy.feasibility.isAchievable)   // catch the red-forever config
+// Catch the red-forever config. Deliberately not `precondition`: this package
+// argues that a trap inside a CI gate is indistinguishable from an
+// infrastructure outage, and the sample code should not install the failure
+// mode the library spends a file avoiding.
+guard case .achievable = policy.feasibility else {
+    FileHandle.standardError.write(Data("eval policy can never pass: \(policy.feasibility)\n".utf8))
+    exit(2)
+}
 
 let runner = EvalGateRunner(
     backend: myFoundationModelsAdapter,          // or Fixtures.demoBackend()
@@ -271,26 +305,53 @@ swift test
 
 ## Verification
 
-What was actually done, stated exactly:
+Three buckets, because "we ran a test" and "we wrote a workflow file" are not
+the same claim.
+
+**Verified — this actually happened.**
 
 - **Clean build** (`rm -rf .build` first, so this is a real from-scratch compile
-  of every file, not an up-to-date no-op) with `-Xswiftc -warnings-as-errors` on
-  Swift 6.0.3, Linux aarch64. Zero warnings — machine-enforced in CI, not
-  asserted in prose.
-- **75 XCTest cases, 0 failures.** Coverage includes every trapping-arithmetic
-  edge case, the matcher's search-budget ceiling, the deep-nesting stack guard,
-  empty/boundary trajectories, actor-reentrancy under concurrent sweeps, and the
-  negative controls named above.
+  of every file, not an up-to-date no-op) with `swift build -Xswiftc
+  -warnings-as-errors` *and* `swift build --build-tests -Xswiftc
+  -warnings-as-errors` on Swift 6.0.3, Linux aarch64. **Zero warnings.**
+- **82 XCTest cases, 0 failures.** Coverage includes every trapping-arithmetic
+  edge case, the matcher's search-budget ceiling, the untrusted-nesting stack
+  guards on both the matcher and the value tree, empty/boundary trajectories,
+  actor-reentrancy under two concurrent sweeps on one budget, and the negative
+  controls named above.
 - **Statistical expectations are precomputed out-of-band**, not produced by the
-  code under test. A test that computes its own expectation with the same code
-  it is testing asserts only that the code is deterministic.
-- CI runs the Linux job (clean build, warnings-as-errors, tests) and a macOS
-  job compiling the UI target for `generic/platform=iOS Simulator`. Live status
-  is on the [Actions tab](https://github.com/rajatslakhina/trajectory-eval-gate-kit/actions).
+  code under test, and the deterministic backend's outcome sequence is pinned to
+  a value recorded in an earlier process. A test that computes its own
+  expectation with the code it is testing asserts only that the code is
+  deterministic.
+
+**Configured but not yet run at the time of writing.**
+
+- The Linux CI job and the macOS job that compiles `TrajectoryEvalGateUI` for
+  `generic/platform=iOS Simulator`. Live status:
+  [Actions](https://github.com/rajatslakhina/trajectory-eval-gate-kit/actions) —
+  read it there rather than trusting this paragraph.
+- Note what this implies: **no SwiftUI source in this repository has been
+  compiled by anything yet.** `EvalGateDashboardView.swift` sits entirely behind
+  `#if canImport(SwiftUI)`, so the Linux build that produced the zero-warning
+  result above skipped every line of it. The macOS job exists precisely to close
+  that gap.
+
+**Not established.**
+
+- **The app was never launched, and no screenshots exist.** Requesting control
+  of the Simulator returned, verbatim: *"Computer-use access to \"Simulator\"
+  can't be approved during a scheduled run."* "Compiles for a Simulator" and
+  "ran on a Simulator" are different claims, and neither is being made from the
+  other.
 
 ## Demo app
 
-Demo app: (added after the companion repo is pushed — see below)
+**Demo app:** [trajectory-eval-gate-demo-app](https://github.com/rajatslakhina/trajectory-eval-gate-demo-app)
+— a SwiftUI app that consumes this package as a version-pinned remote
+dependency and renders a sweep: the feasibility banner, a bound-vs-threshold bar
+per case, early stopping, and the three-way `pass` / `fail` / `inconclusive`
+verdict.
 
 ## Licence
 
