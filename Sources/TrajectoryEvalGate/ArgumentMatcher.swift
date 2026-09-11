@@ -76,6 +76,39 @@ extension ArgumentMatcher {
     /// a reason*, which surfaces as a gate failure a human can read.
     public static let maximumNestingDepth = 32
 
+    /// Returns a matcher whose composite nesting is within
+    /// ``maximumNestingDepth`` and whose embedded literals are within
+    /// ``ArgumentValue/maximumDepth``.
+    ///
+    /// The companion to ``ArgumentValue/depthLimited(to:)``: a contract can be
+    /// decoded from a dataset file, so a matcher's own depth *and* the depth of
+    /// the literals inside it are both untrusted input to recursive code —
+    /// `evaluate`, the synthesised `Equatable` conformance, and the `==` inside
+    /// `.equals`. Normalising at construction means everything downstream sees
+    /// a bounded tree.
+    ///
+    /// A subtree past the ceiling becomes `.anyOf([])`, which never matches and
+    /// says so, rather than a silently-passing `.any`. The recursion is bounded
+    /// by `depth` rather than by the input, so the normaliser cannot overflow
+    /// on the input it defends against.
+    public func normalized(depth: Int = ArgumentMatcher.maximumNestingDepth) -> ArgumentMatcher {
+        guard depth > 0 else { return .anyOf([]) }
+        switch self {
+        case .equals(let value):
+            return .equals(value.depthLimited())
+        case .oneOf(let values):
+            return .oneOf(values.map { $0.depthLimited() })
+        case .not(let inner):
+            return .not(inner.normalized(depth: depth - 1))
+        case .allOf(let matchers):
+            return .allOf(matchers.map { $0.normalized(depth: depth - 1) })
+        case .anyOf(let matchers):
+            return .anyOf(matchers.map { $0.normalized(depth: depth - 1) })
+        case .any, .stringContains, .stringHasPrefix, .intBetween, .doubleBetween, .absent, .present:
+            return self
+        }
+    }
+
     /// Evaluates this matcher against the value found (or not found) at `key`.
     ///
     /// - Parameter value: `nil` means the key was absent from the call.

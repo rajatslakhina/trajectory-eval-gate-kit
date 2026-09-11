@@ -98,7 +98,7 @@ public struct GatePolicy: Sendable, Equatable {
     /// Answers the question almost nobody asks before merging an eval config:
     /// *can this gate pass at all?*
     ///
-    /// A 95% lower bound needs roughly 60 consecutive passes; a team that
+    /// A 0.95 lower bound needs 73 consecutive passes; a team that
     /// writes `requiredPassRateLowerBound: 0.95, maximumRuns: 10` has built a
     /// gate that is red forever, and will conclude the feature is broken rather
     /// than the policy. Surfacing this as a first-class value — checked in the

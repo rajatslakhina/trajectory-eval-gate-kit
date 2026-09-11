@@ -22,6 +22,10 @@ public struct ExpectedStep: Sendable, Equatable {
     /// Human-readable label used in diffs and in the demo UI.
     public let label: String?
 
+    /// Matchers are normalised on the way in — see
+    /// ``ArgumentMatcher/normalized(depth:)``. Together with `ToolCall.init`
+    /// this is the second of the two boundaries at which untrusted nesting
+    /// depth is bounded, so nothing downstream can recurse without a ceiling.
     public init(
         toolName: String,
         arguments: [String: ArgumentMatcher] = [:],
@@ -29,7 +33,7 @@ public struct ExpectedStep: Sendable, Equatable {
         label: String? = nil
     ) {
         self.toolName = toolName
-        self.arguments = arguments
+        self.arguments = arguments.mapValues { $0.normalized() }
         self.isOptional = isOptional
         self.label = label
     }

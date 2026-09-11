@@ -116,6 +116,49 @@ extension ArgumentValue: CustomStringConvertible {
     }
 }
 
+extension ArgumentValue {
+
+    /// Hard ceiling on `.list` / `.object` nesting for any value stored in a
+    /// ``ToolCall`` or an ``ArgumentMatcher``.
+    ///
+    /// `==`, `hash(into:)` and `description` all walk this tree recursively.
+    /// Tool arguments arrive as JSON from a backend, which makes their *depth*
+    /// untrusted input to three recursive functions — and a 100,000-deep list
+    /// overflows the stack, which is a crash rather than a catchable error, so
+    /// it would take the whole CI job down rather than failing one case. That
+    /// is precisely the failure mode this package advertises immunity to.
+    ///
+    /// The defence is normalisation at the boundary rather than a guard in
+    /// each walker: values are depth-limited when they enter a `ToolCall` or an
+    /// `ExpectedStep`, so every value the matcher, the differ and the hasher
+    /// ever see is provably shallower than this. 64 is far beyond any honest
+    /// tool schema and far below any stack limit.
+    public static let maximumDepth = 64
+
+    /// Substituted for a subtree that exceeded ``maximumDepth``. Visible in
+    /// diffs, so a truncated argument is reported rather than silently altered.
+    public static let truncationMarker = "<truncated: exceeded ArgumentValue.maximumDepth>"
+
+    /// Returns a value no deeper than `maxDepth`, replacing anything below
+    /// that with ``truncationMarker``.
+    ///
+    /// The recursion here is bounded by `maxDepth` itself — it stops
+    /// descending at the cap rather than at the bottom of the input — so the
+    /// sanitiser cannot overflow on the very input it exists to defend
+    /// against.
+    public func depthLimited(to maxDepth: Int = ArgumentValue.maximumDepth) -> ArgumentValue {
+        guard maxDepth > 0 else { return .string(Self.truncationMarker) }
+        switch self {
+        case .list(let values):
+            return .list(values.map { $0.depthLimited(to: maxDepth - 1) })
+        case .object(let values):
+            return .object(values.mapValues { $0.depthLimited(to: maxDepth - 1) })
+        case .string, .int, .double, .bool, .null:
+            return self
+        }
+    }
+}
+
 /// A single tool invocation observed during an agent run.
 public struct ToolCall: Sendable, Hashable {
     /// The tool's registered name, e.g. `"lookUpProduct"`.
@@ -127,9 +170,13 @@ public struct ToolCall: Sendable, Hashable {
     /// depend on a UUID the backend invents at run time.
     public let id: String?
 
+    /// Arguments are depth-limited on the way in — see
+    /// ``ArgumentValue/maximumDepth``. This is the boundary at which untrusted
+    /// JSON depth stops being able to reach the recursive `==`, `hash(into:)`
+    /// and `description` walkers.
     public init(name: String, arguments: [String: ArgumentValue] = [:], id: String? = nil) {
         self.name = name
-        self.arguments = arguments
+        self.arguments = arguments.mapValues { $0.depthLimited() }
         self.id = id
     }
 }

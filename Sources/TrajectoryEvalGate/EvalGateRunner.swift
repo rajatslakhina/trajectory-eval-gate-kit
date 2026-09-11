@@ -50,7 +50,14 @@ public struct GateReport: Sendable, Equatable {
     public let backendIdentifier: String
     public let policy: GatePolicy
     public let results: [CaseResult]
+    /// Runs performed **by this sweep**, not the runner's lifetime total.
+    ///
+    /// The distinction matters as soon as two sweeps share a runner: reporting
+    /// the shared ledger would make a sweep that performed 12 runs print "25
+    /// runs" in its headline because the other sweep spent the rest. Use
+    /// ``EvalGateRunner/spentRuns`` for the lifetime total.
     public let runsSpent: Int
+    /// Tokens spent by this sweep. Same distinction as ``runsSpent``.
     public let tokensSpent: Int
     /// `true` when sampling stopped because the budget ran out rather than
     /// because the verdicts were settled.
@@ -173,6 +180,11 @@ public actor EvalGateRunner {
     public func evaluate(cases: [EvalCase], policy: GatePolicy) async -> GateReport {
         var results: [CaseResult] = []
         var budgetExhausted = false
+        // Per-sweep counters, deliberately local rather than read off the
+        // shared ledger at the end: two concurrent sweeps must each report what
+        // *they* spent, not what the runner spent in total.
+        var sweepRuns = 0
+        var sweepTokens = 0
 
         for evalCase in cases {
             var outcomes: [Bool] = []
@@ -188,10 +200,12 @@ public actor EvalGateRunner {
                     budgetExhausted = true
                     break
                 }
+                sweepRuns = Saturating.add(sweepRuns, 1)
                 do {
                     let attempt = Saturating.add(outcomes.count, errorCount)
                     let runResult = try await backend.run(evalCase, attempt: attempt)
                     settle(tokens: runResult.tokensUsed)
+                    sweepTokens = Saturating.add(sweepTokens, max(0, runResult.tokensUsed))
                     let match = TrajectoryMatcher.match(runResult.trajectory, against: evalCase.expectation)
                     outcomes.append(match.didMatch)
                     if representativeDiff == nil, let diff = match.diff {
@@ -226,8 +240,8 @@ public actor EvalGateRunner {
             backendIdentifier: backend.identifier,
             policy: policy,
             results: results,
-            runsSpent: runsSpent,
-            tokensSpent: tokensSpent,
+            runsSpent: sweepRuns,
+            tokensSpent: sweepTokens,
             budgetExhausted: budgetExhausted
         )
     }

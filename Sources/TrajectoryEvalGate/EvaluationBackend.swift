@@ -11,19 +11,30 @@
 //  Linux CI. Binding that logic to a specific inference framework would make
 //  all of it untestable without a device.
 //
-//  So the framework lives behind one protocol with one method. Concretely:
+//  So the framework lives behind one protocol with one method.
 //
-//    * On Apple platforms, an adapter conforms by driving Apple's Evaluations
-//      framework (`Evaluation`, `ToolCallEvaluator`, `TrajectoryExpectation`)
-//      against Foundation Models — on-device or Private Cloud Compute — and
+//  Exactly one conformer ships in this package: ``DeterministicBackend``, a
+//  seeded fake, which is what the tests and the demo app use. The adapters
+//  below are the intended shape, not code that exists here:
+//
+//    * On Apple platforms an adapter *would* conform by driving Apple's
+//      Evaluations framework (`Evaluation`, `ToolCallEvaluator`) against
+//      Foundation Models — on-device or Private Cloud Compute — and
 //      translating its result into a ``Trajectory``.
-//    * A remote model behind an HTTP API conforms by parsing tool-call blocks
-//      out of the response.
-//    * ``DeterministicBackend`` conforms with a seeded PRNG, which is what the
-//      tests and the demo app use.
+//    * A remote model behind an HTTP API *would* conform by parsing tool-call
+//      blocks out of the response.
 //
-//  The gate cannot tell them apart, which is the point: the same policy, the
-//  same thresholds, and the same report apply whether the model is on the
+//  Note for anyone writing the Apple adapter: this package's
+//  ``TrajectoryExpectation`` and ``ArgumentMatcher`` collide by name with types
+//  Apple's `Evaluations` framework exports. A file importing both modules has
+//  to module-qualify every use of either (`TrajectoryEvalGate.ArgumentMatcher`
+//  vs `Evaluations.ArgumentMatcher`), or `typealias` one side at the top of the
+//  adapter. The names are kept because they are the right domain names on this
+//  side of the seam, and because an adapter is the only file that ever sees
+//  both.
+//
+//  The gate cannot tell backends apart, which is the point: the same policy,
+//  the same thresholds, and the same report apply whether the model is on the
 //  device or across the network.
 //
 
@@ -66,9 +77,18 @@ public struct BackendRunResult: Sendable, Equatable {
     public let tokensUsed: Int
     /// A model-as-judge quality score in `0...1`, when the backend ran a judge.
     ///
-    /// Note that a judged score only participates in the verdict if the judge
-    /// has been calibrated — see ``JudgeCalibration``. An uncalibrated judge is
-    /// carried in the report as information, never as a gate.
+    /// **Carried, not consumed.** As of this version nothing in the package
+    /// reads this value: ``EvalGateRunner`` grades a run purely on whether its
+    /// trajectory satisfied the contract, and no judge score reaches
+    /// ``CaseResult`` or ``GateReport``. It is here so a backend can report one
+    /// and an adapter can act on it.
+    ///
+    /// The rule an adapter *should* apply before letting a judge influence a
+    /// verdict is ``JudgeCalibration``: a judge that has not demonstrated
+    /// agreement with a human on already-labelled cases must not be allowed to
+    /// fail a build. That check is implemented and tested here; wiring it into
+    /// the verdict is deliberately left to the adapter, because whether answer
+    /// quality gates a release is a product decision, not a library one.
     public let judgeScore: Double?
 
     public init(trajectory: Trajectory, tokensUsed: Int = 0, judgeScore: Double? = nil) {

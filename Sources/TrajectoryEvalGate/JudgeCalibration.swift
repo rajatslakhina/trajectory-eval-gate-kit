@@ -130,8 +130,15 @@ public enum JudgeCalibration {
     ///
     /// Three independent ways to be rejected, in order:
     ///   1. too few labelled samples,
-    ///   2. kappa undefined (a constant rater — the rubber stamp),
+    ///   2. kappa undefined — which happens only when *both* raters are
+    ///      constant and identical, so chance agreement is exactly 1,
     ///   3. kappa below the bar.
+    ///
+    /// The rubber-stamp judge is caught by (3), not (2): against a 90%-passing
+    /// set it has a perfectly well-defined kappa of exactly 0 (observed
+    /// agreement 0.9, chance agreement 0.9, denominator 0.1). That is the point
+    /// — a defined-but-zero kappa is what "this judge adds no information"
+    /// looks like numerically.
     public static func verdict(
         for samples: [CalibrationSample],
         minimumKappa: Double = defaultMinimumKappa,
