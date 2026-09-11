@@ -305,8 +305,8 @@ swift test
 
 ## Verification
 
-Three buckets, because "we ran a test" and "we wrote a workflow file" are not
-the same claim.
+Two buckets, because "the suite is green" and "someone ran the app" are not the
+same claim.
 
 **Verified — this actually happened.**
 
@@ -325,17 +325,20 @@ the same claim.
   expectation with the code it is testing asserts only that the code is
   deterministic.
 
-**Configured but not yet run at the time of writing.**
-
-- The Linux CI job and the macOS job that compiles `TrajectoryEvalGateUI` for
-  `generic/platform=iOS Simulator`. Live status:
-  [Actions](https://github.com/rajatslakhina/trajectory-eval-gate-kit/actions) —
-  read it there rather than trusting this paragraph.
-- Note what this implies: **no SwiftUI source in this repository has been
-  compiled by anything yet.** `EvalGateDashboardView.swift` sits entirely behind
-  `#if canImport(SwiftUI)`, so the Linux build that produced the zero-warning
-  result above skipped every line of it. The macOS job exists precisely to close
-  that gap.
+- **CI is green on both jobs.** The Linux job reproduces the clean build and the
+  test run in a container; the `macos-15` job compiles `TrajectoryEvalGateUI`
+  for `generic/platform=iOS Simulator`. That second job is what covers
+  `EvalGateDashboardView.swift`, which sits entirely behind
+  `#if canImport(SwiftUI)` and is therefore invisible to the Linux build — so
+  the SwiftUI layer is compiled by CI, not merely written. Read the live result
+  on the
+  [Actions tab](https://github.com/rajatslakhina/trajectory-eval-gate-kit/actions)
+  rather than trusting this paragraph; a run ID quoted here would go stale on
+  the next commit.
+- `generic/platform=iOS Simulator` deliberately, never a named device: pinning
+  to `name=iPhone 16` ties the job to whichever simulator runtimes happen to be
+  installed on that day's runner image, and a compile check needs no device to
+  exist.
 
 **Not established.**
 
