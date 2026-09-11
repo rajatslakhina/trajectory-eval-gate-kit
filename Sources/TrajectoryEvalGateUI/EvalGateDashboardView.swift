@@ -223,21 +223,31 @@ private struct CaseRow: View {
             LabeledLine("Lower bound", format(result.evidence.passRateLowerBound))
             LabeledLine("Required", format(threshold))
             LabeledLine("Stability", stabilityText)
-            if result.evidence.stoppedEarly {
-                LabeledLine("Sampling", "stopped early — verdict already settled")
-            }
-            if result.errorCount > 0 {
-                LabeledLine("Errored runs", "\(result.errorCount)")
-            }
-            if let drifted = result.driftIsSignificant {
-                LabeledLine("Drift vs baseline", drifted ? "significant" : "within noise")
-            }
-            if let diff = result.representativeDiff {
-                Text(diff.summary)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+
+            // Grouped, not inlined. `ViewBuilder` tops out at ten children;
+            // inlining the four conditionals would put this `Card` at exactly
+            // ten, leaving no room to add a row without an unhelpful
+            // type-check error. Extracted, the card holds seven.
+            conditionalDetail
+        }
+    }
+
+    @ViewBuilder
+    private var conditionalDetail: some View {
+        if result.evidence.stoppedEarly {
+            LabeledLine("Sampling", "stopped early — verdict already settled")
+        }
+        if result.errorCount > 0 {
+            LabeledLine("Errored runs", "\(result.errorCount)")
+        }
+        if let drifted = result.driftIsSignificant {
+            LabeledLine("Drift vs baseline", drifted ? "significant" : "within noise")
+        }
+        if let diff = result.representativeDiff {
+            Text(diff.summary)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
